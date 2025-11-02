@@ -174,10 +174,13 @@ fn run_mysqldump(config: &AppConfig, output_path: &Path) -> Result<(), BackupErr
         .arg("--port")
         .arg(config.mysql.port.to_string())
         .arg("--user")
-        .arg(&config.mysql.username)
-        .arg("--password")
-        .arg(&config.mysql.password)
-        .arg("--single-transaction")
+        .arg(&config.mysql.username);
+
+    if !config.mysql.password.is_empty() {
+        cmd.arg(format!("--password={}", config.mysql.password));
+    }
+
+    cmd.arg("--single-transaction")
         .arg("--routines")
         .arg("--triggers")
         .arg("--events")

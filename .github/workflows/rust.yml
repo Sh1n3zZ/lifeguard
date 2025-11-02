@@ -16,11 +16,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Build
-        run: cargo build --verbose
+        run: cargo build --verbose --release
       - name: Run tests
         run: cargo test --verbose
       - name: Upload release artifact
         uses: actions/upload-artifact@v4
         with:
           name: lifeguard
-          path: target/${{ matrix.BUILD_TARGET }}/lifeguard
+          path: target/release/lifeguard

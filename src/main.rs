@@ -1,45 +1,48 @@
 mod backup;
+mod cli;
 mod config;
+mod scheduler;
+mod service;
 mod storage;
 
-/// Minimal CLI: default action `run` performs backup -> upload -> cleanup
+/// CLI entrypoint using clap
 #[tokio::main]
 async fn main() {
-    // Very small CLI parser
-    let mut args = std::env::args().skip(1);
-    let cmd = args.next().unwrap_or_else(|| "run".to_string());
+    use clap::Parser;
+    let args = cli::Cli::parse();
 
-    match cmd.as_str() {
-        "run" => {
+    match args.command {
+        cli::Commands::Run => {
             if let Err(e) = cmd_run().await {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
         }
-        "backup" => {
+        cli::Commands::Backup => {
             if let Err(e) = cmd_backup().await {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
         }
-        "help" | "-h" | "--help" => {
-            print_help();
+        cli::Commands::Start => {
+            if let Err(e) = service::start() {
+                eprintln!("Failed to start daemon: {}", e);
+                std::process::exit(1);
+            }
         }
-        _ => {
-            eprintln!("Unknown command: {}", cmd);
-            print_help();
-            std::process::exit(2);
+        cli::Commands::Stop => {
+            if let Err(e) = service::stop() {
+                eprintln!("Failed to stop daemon: {}", e);
+                std::process::exit(1);
+            }
+        }
+        cli::Commands::Restart => {
+            if let Err(e) = service::restart() {
+                eprintln!("Failed to restart daemon: {}", e);
+                std::process::exit(1);
+            }
         }
     }
-}
-
-/// Print minimal CLI help
-fn print_help() {
-    println!("lifeguard - MySQL backup to S3");
-    println!("Usage:");
-    println!("  lifeguard run      # backup -> upload -> cleanup");
-    println!("  lifeguard backup   # backup locally only");
-    println!("  lifeguard help     # show this help");
 }
 
 /// Execute full workflow: backup -> upload -> cleanup

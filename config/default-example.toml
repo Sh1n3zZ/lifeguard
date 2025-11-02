@@ -1,0 +1,28 @@
+# MySQL Database Configuration
+[mysql]
+host = "localhost"
+port = 3306
+username = "root"
+password = "your_password"
+database = "your_database"
+
+# AWS S3 Configuration
+[s3]
+bucket = "your-backup-bucket"
+region = "us-east-1"
+access_key_id = "YOUR_ACCESS_KEY_ID"
+secret_access_key = "YOUR_SECRET_ACCESS_KEY"
+# Optional: Custom S3 endpoint (for S3-compatible services like MinIO)
+# endpoint = "https://s3.example.com"
+# Optional: S3 key prefix for organizing backups
+# prefix = "backups/"
+
+# Backup Configuration
+[backup]
+temp_dir = "/tmp/backups"
+# Cron expression for backup schedule (e.g., "0 2 * * *" means daily at 2 AM)
+schedule = "0 2 * * *"
+# Maximum number of backup files to retain in S3 (older backups will be deleted)
+retention_count = 30
+# Backup file name format (supports placeholders: {timestamp}, {database})
+file_format = "{database}_{timestamp}.sql.gz"

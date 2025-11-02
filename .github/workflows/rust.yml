@@ -11,16 +11,27 @@ env:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64-unknown-linux-gnu, x86_64-unknown-linux-musl]
 
     steps:
       - uses: actions/checkout@v4
-      - name: Build
-        run: cargo build --verbose --release
+      - name: Install target
+        run: rustup target add ${{ matrix.target }}
+      - name: Install musl tools (for musl target)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+      - name: Build (release)
+        run: cargo build --verbose --release --target ${{ matrix.target }}
       - name: Run tests
         run: cargo test --verbose
       - name: Upload release artifact
         uses: actions/upload-artifact@v4
         with:
-          name: lifeguard
-          path: target/release/lifeguard
+          name: lifeguard-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/lifeguard

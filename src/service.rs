@@ -13,13 +13,12 @@ mod unix_daemon {
     };
     use nix::sys::stat::{Mode, umask};
     use nix::sys::wait::waitpid;
-    use nix::unistd::{
-        ForkResult, Pid, chdir, close, dup2, fork, getpid, pipe, read, setsid, write,
-    };
+    use nix::unistd::{ForkResult, Pid, chdir, dup2, fork, getpid, pipe, read, setsid, write};
+    use nix::{errno::Errno, libc};
     use std::fs::OpenOptions;
     use std::io::{self, Read, Write};
     use std::net::Shutdown;
-    use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+    use std::os::fd::{AsFd, FromRawFd, OwnedFd};
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::sync::{Arc, Mutex};
     use std::thread;
@@ -30,7 +29,7 @@ mod unix_daemon {
 
     fn nix_err_to_io(err: nix::Error) -> io::Error {
         match err {
-            nix::Error::Sys(errno) => io::Error::from_raw_os_error(errno as i32),
+            nix::Error::Errno(errno) => io::Error::from_raw_os_error(errno as i32),
             other => io::Error::new(io::ErrorKind::Other, other.to_string()),
         }
     }
@@ -150,21 +149,19 @@ mod unix_daemon {
             .read(true)
             .write(true)
             .open("/dev/null")?;
-        let fd = dev_null.as_raw_fd();
-        dup2(fd, libc::STDIN_FILENO)?;
-        dup2(fd, libc::STDOUT_FILENO)?;
-        dup2(fd, libc::STDERR_FILENO)?;
+        dup2(&dev_null, libc::STDIN_FILENO)?;
+        dup2(&dev_null, libc::STDOUT_FILENO)?;
+        dup2(&dev_null, libc::STDERR_FILENO)?;
         Ok(())
     }
 
-    fn write_pid_to_pipe(pipe_fd: RawFd) -> Result<(), Box<dyn Error>> {
+    fn write_pid_to_pipe(pipe_fd: OwnedFd) -> Result<(), Box<dyn Error>> {
         let pid_bytes = format!("{}\n", getpid().as_raw()).into_bytes();
         let mut written = 0usize;
         while written < pid_bytes.len() {
-            let chunk = write(pipe_fd, &pid_bytes[written..])?;
+            let chunk = write(pipe_fd.as_fd(), &pid_bytes[written..])?;
             written += chunk;
         }
-        close(pipe_fd)?;
         Ok(())
     }
 
@@ -223,7 +220,7 @@ mod unix_daemon {
         });
     }
 
-    fn finalize_daemon(pipe_fd: RawFd) -> Result<(), Box<dyn Error>> {
+    fn finalize_daemon(pipe_fd: OwnedFd) -> Result<(), Box<dyn Error>> {
         configure_daemon_environment()?;
         write_pid_to_pipe(pipe_fd)?;
 
@@ -270,11 +267,11 @@ mod unix_daemon {
         let (read_fd, write_fd) = pipe().map_err(|e| format!("Failed to create pipe: {}", e))?;
         match unsafe { fork() } {
             Ok(ForkResult::Parent { child, .. }) => {
-                close(write_fd)?;
+                drop(write_fd);
                 let mut buffer = [0u8; PIPE_BUFFER_SIZE];
-                let n = read(read_fd, &mut buffer)
+                let n = read(read_fd.as_fd(), &mut buffer)
                     .map_err(|e| format!("Failed to read daemon PID: {}", e))?;
-                close(read_fd)?;
+                drop(read_fd);
                 let pid_str = std::str::from_utf8(&buffer[..n])
                     .map_err(|e| format!("Failed to parse daemon PID: {}", e))?
                     .trim()
@@ -284,24 +281,28 @@ mod unix_daemon {
                 Ok(())
             }
             Ok(ForkResult::Child) => {
-                close(read_fd)?;
+                drop(read_fd);
                 setsid()?;
-                match unsafe { fork() } {
-                    Ok(ForkResult::Parent { .. }) => {
-                        close(write_fd)?;
-                        unsafe { libc::_exit(0) };
-                    }
-                    Ok(ForkResult::Child) => finalize_daemon(write_fd),
-                    Err(e) => {
-                        close(write_fd)?;
-                        Err(format!("Failed to fork daemon: {}", e).into())
-                    }
-                }
+                spawn_grandchild(write_fd)
             }
             Err(e) => {
-                close(read_fd)?;
-                close(write_fd)?;
+                drop(read_fd);
+                drop(write_fd);
                 Err(format!("Failed to fork: {}", e).into())
+            }
+        }
+    }
+
+    fn spawn_grandchild(write_fd: OwnedFd) -> Result<(), Box<dyn Error>> {
+        match unsafe { fork() } {
+            Ok(ForkResult::Parent { .. }) => {
+                drop(write_fd);
+                unsafe { libc::_exit(0) };
+            }
+            Ok(ForkResult::Child) => finalize_daemon(write_fd),
+            Err(e) => {
+                drop(write_fd);
+                Err(format!("Failed to fork daemon: {}", e).into())
             }
         }
     }

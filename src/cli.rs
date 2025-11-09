@@ -30,4 +30,7 @@ pub enum Commands {
 
     /// Restart the background scheduler (daemon)
     Restart,
+
+    /// Show execution history for scheduled tasks
+    Logs,
 }

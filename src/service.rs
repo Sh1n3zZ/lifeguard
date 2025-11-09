@@ -1,131 +1,318 @@
 use std::error::Error;
-use std::path::PathBuf;
-
-fn pid_file_path() -> PathBuf {
-    std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
-        .join("lifeguard.pid")
-}
 
 #[cfg(all(unix, feature = "daemon"))]
 mod unix_daemon {
     use super::*;
-    use crate::{config::AppConfig, scheduler};
-    use daemonize::Daemonize;
-    use fs2::FileExt;
-    use nix::sys::signal::{Signal, kill};
-    use nix::unistd::Pid;
-    use std::fs::{self, File};
-    use std::io::{Read, Write};
-    use std::path::Path;
+    use crate::{
+        config::AppConfig,
+        scheduler::{self, TaskLogEntry},
+    };
+    use nix::sys::signal::{self, Signal};
+    use nix::sys::socket::{
+        AddressFamily, SockAddr, SockFlag, SockType, UnixAddr, bind, connect, listen, socket,
+    };
+    use nix::sys::stat::{Mode, umask};
+    use nix::sys::wait::waitpid;
+    use nix::unistd::{
+        ForkResult, Pid, chdir, close, dup2, fork, getpid, pipe, read, setsid, write,
+    };
+    use std::fs::OpenOptions;
+    use std::io::{self, Read, Write};
+    use std::net::Shutdown;
+    use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::sync::{Arc, Mutex};
     use std::thread;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
-    fn is_process_running(pid: i32) -> bool {
-        match kill(Pid::from_raw(pid), None) {
-            Ok(_) => true,
-            Err(nix::errno::Errno::ESRCH) => false,
-            Err(_) => true,
+    const CONTROL_SOCKET_NAME: &[u8] = b"lifeguard_daemon_control";
+    const PIPE_BUFFER_SIZE: usize = 64;
+
+    fn nix_err_to_io(err: nix::Error) -> io::Error {
+        match err {
+            nix::Error::Sys(errno) => io::Error::from_raw_os_error(errno as i32),
+            other => io::Error::new(io::ErrorKind::Other, other.to_string()),
         }
     }
 
-    fn read_pid_from_file(path: &Path) -> Option<i32> {
-        if !path.exists() {
-            return None;
+    fn connect_control_socket() -> io::Result<UnixStream> {
+        let fd = socket(
+            AddressFamily::Unix,
+            SockType::Stream,
+            SockFlag::empty(),
+            None,
+        )
+        .map_err(nix_err_to_io)?;
+
+        let addr = UnixAddr::new_abstract(CONTROL_SOCKET_NAME)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+        if let Err(err) = connect(fd, &SockAddr::Unix(addr)) {
+            let io_err = nix_err_to_io(err);
+            unsafe {
+                libc::close(fd);
+            }
+            return Err(io_err);
         }
-        let mut content = String::new();
-        if File::open(path)
-            .and_then(|mut f| f.read_to_string(&mut content))
-            .is_ok()
-        {
-            content.trim().parse::<i32>().ok()
+
+        Ok(unsafe { UnixStream::from_raw_fd(fd) })
+    }
+
+    fn send_control_command(command: &str) -> io::Result<Option<String>> {
+        let mut stream = match connect_control_socket() {
+            Ok(stream) => stream,
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    io::ErrorKind::NotFound
+                        | io::ErrorKind::ConnectionRefused
+                        | io::ErrorKind::ConnectionReset
+                        | io::ErrorKind::AddrNotAvailable
+                ) =>
+            {
+                return Ok(None);
+            }
+            Err(err) => return Err(err),
+        };
+
+        stream.write_all(command.as_bytes())?;
+        stream.flush()?;
+        stream.shutdown(Shutdown::Write)?;
+
+        let mut response = String::new();
+        stream.read_to_string(&mut response)?;
+        if response.is_empty() {
+            Ok(Some(String::new()))
         } else {
-            None
+            Ok(Some(response.trim().to_string()))
         }
     }
 
-    fn write_and_lock_pid(path: &Path, pid: i32) -> std::io::Result<()> {
-        let file = File::create(path)?;
-        // Take exclusive lock and keep it for the process lifetime
-        file.lock_exclusive()?;
-        writeln!(&file, "{}", pid)?;
-        // Leak the file handle to keep the lock held
-        std::mem::forget(file);
+    fn request_existing_pid() -> Result<Option<i32>, Box<dyn Error>> {
+        match send_control_command("pid\n") {
+            Ok(Some(pid_str)) if !pid_str.is_empty() => {
+                let pid = pid_str.parse::<i32>()?;
+                Ok(Some(pid))
+            }
+            Ok(_) => Ok(None),
+            Err(err) => match err.kind() {
+                io::ErrorKind::ConnectionRefused
+                | io::ErrorKind::ConnectionReset
+                | io::ErrorKind::NotFound
+                | io::ErrorKind::AddrNotAvailable => Ok(None),
+                _ => Err(Box::new(err)),
+            },
+        }
+    }
+
+    fn create_control_listener() -> io::Result<UnixListener> {
+        let fd = socket(
+            AddressFamily::Unix,
+            SockType::Stream,
+            SockFlag::empty(),
+            None,
+        )
+        .map_err(nix_err_to_io)?;
+
+        if let Err(err) = nix::fcntl::fcntl(
+            fd,
+            nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
+        ) {
+            unsafe {
+                libc::close(fd);
+            }
+            return Err(nix_err_to_io(err));
+        }
+
+        let addr = UnixAddr::new_abstract(CONTROL_SOCKET_NAME)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+        if let Err(err) = bind(fd, &SockAddr::Unix(addr)) {
+            unsafe {
+                libc::close(fd);
+            }
+            return Err(nix_err_to_io(err));
+        }
+
+        if let Err(err) = listen(fd, 32) {
+            unsafe {
+                libc::close(fd);
+            }
+            return Err(nix_err_to_io(err));
+        }
+
+        Ok(unsafe { UnixListener::from_raw_fd(fd) })
+    }
+
+    fn configure_daemon_environment() -> Result<(), Box<dyn Error>> {
+        umask(Mode::from_bits_truncate(0o027));
+        chdir("/")?;
+
+        let dev_null = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/null")?;
+        let fd = dev_null.as_raw_fd();
+        dup2(fd, libc::STDIN_FILENO)?;
+        dup2(fd, libc::STDOUT_FILENO)?;
+        dup2(fd, libc::STDERR_FILENO)?;
+        Ok(())
+    }
+
+    fn write_pid_to_pipe(pipe_fd: RawFd) -> Result<(), Box<dyn Error>> {
+        let pid_bytes = format!("{}\n", getpid().as_raw()).into_bytes();
+        let mut written = 0usize;
+        while written < pid_bytes.len() {
+            let chunk = write(pipe_fd, &pid_bytes[written..])?;
+            written += chunk;
+        }
+        close(pipe_fd)?;
+        Ok(())
+    }
+
+    fn spawn_control_thread(listener: UnixListener, history: Arc<Mutex<Vec<TaskLogEntry>>>) {
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                match stream {
+                    Ok(mut stream) => {
+                        let mut buf = String::new();
+                        if stream.read_to_string(&mut buf).is_ok() {
+                            let command = buf.trim();
+                            match command {
+                                "pid" => {
+                                    let _ = writeln!(stream, "{}", getpid().as_raw());
+                                }
+                                "stop" => {
+                                    let _ = stream.write_all(b"ok\n");
+                                    let _ = stream.flush();
+                                    let _ = signal::kill(Pid::this(), Signal::SIGTERM);
+                                }
+                                "logs" => {
+                                    let response = {
+                                        if let Ok(buffer) = history.lock() {
+                                            if buffer.is_empty() {
+                                                String::from("No logs available\n")
+                                            } else {
+                                                let mut lines: Vec<String> = buffer
+                                                    .iter()
+                                                    .rev()
+                                                    .map(|entry| entry.format_line())
+                                                    .collect();
+                                                lines.push(String::new());
+                                                lines.join("\n")
+                                            }
+                                        } else {
+                                            String::from("Failed to read logs\n")
+                                        }
+                                    };
+                                    let _ = stream.write_all(response.as_bytes());
+                                    let _ = stream.flush();
+                                }
+                                _ => {
+                                    let _ = stream.write_all(b"unknown\n");
+                                }
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        if err.kind() == io::ErrorKind::Interrupted {
+                            continue;
+                        }
+                        thread::sleep(Duration::from_millis(100));
+                    }
+                }
+            }
+        });
+    }
+
+    fn finalize_daemon(pipe_fd: RawFd) -> Result<(), Box<dyn Error>> {
+        configure_daemon_environment()?;
+        write_pid_to_pipe(pipe_fd)?;
+
+        let history: Arc<Mutex<Vec<TaskLogEntry>>> = Arc::new(Mutex::new(Vec::new()));
+        let listener = create_control_listener()?;
+        spawn_control_thread(listener, history.clone());
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?;
+        runtime.block_on(async move {
+            let history_for_scheduler = history.clone();
+            match AppConfig::load() {
+                Ok(cfg) => {
+                    if let Err(e) =
+                        scheduler::run_scheduler_forever(cfg, history_for_scheduler).await
+                    {
+                        eprintln!("Scheduler error: {}", e);
+                    }
+                }
+                Err(e) => {
+                    if let Ok(mut buffer) = history.lock() {
+                        buffer.push(TaskLogEntry::failure(format!(
+                            "Failed to load config: {}",
+                            e
+                        )));
+                        if buffer.len() > scheduler::MAX_HISTORY_ENTRIES {
+                            let overflow = buffer.len() - scheduler::MAX_HISTORY_ENTRIES;
+                            buffer.drain(0..overflow);
+                        }
+                    }
+                    eprintln!("Failed to load config: {}", e);
+                }
+            }
+        });
         Ok(())
     }
 
     pub fn start() -> Result<(), Box<dyn Error>> {
-        let pid_path = super::pid_file_path();
-        if let Some(pid) = read_pid_from_file(&pid_path) {
-            if is_process_running(pid) {
-                return Err(format!("Daemon already running with PID {}", pid).into());
-            }
+        if let Some(pid) = request_existing_pid()? {
+            return Err(format!("Daemon already running with PID {}", pid).into());
         }
 
-        // Prepare daemonization
-        let working_dir = pid_path
-            .parent()
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| PathBuf::from("."));
-        let stdout = fs::File::create(working_dir.join("lifeguard.out")).ok();
-        let stderr = fs::File::create(working_dir.join("lifeguard.err")).ok();
-
-        let daemonize = Daemonize::new()
-            .working_directory(&working_dir)
-            .umask(0o027)
-            .stdout(stdout.unwrap_or_else(|| fs::File::create("/dev/null").unwrap()))
-            .stderr(stderr.unwrap_or_else(|| fs::File::create("/dev/null").unwrap()));
-
-        match daemonize.start() {
-            Ok(_) => {
-                // We are now in the child process (daemon)
-                let pid = nix::unistd::getpid().as_raw();
-                let _ = write_and_lock_pid(&pid_path, pid);
-
-                // Build runtime and run scheduler forever
-                let runtime = tokio::runtime::Builder::new_multi_thread()
-                    .enable_all()
-                    .build()?;
-                runtime.block_on(async move {
-                    match AppConfig::load() {
-                        Ok(cfg) => {
-                            if let Err(e) = scheduler::run_scheduler_forever(cfg).await {
-                                eprintln!("Scheduler error: {}", e);
-                            }
-                        }
-                        Err(e) => eprintln!("Failed to load config: {}", e),
-                    }
-                });
+        let (read_fd, write_fd) = pipe().map_err(|e| format!("Failed to create pipe: {}", e))?;
+        match unsafe { fork() } {
+            Ok(ForkResult::Parent { child, .. }) => {
+                close(write_fd)?;
+                let mut buffer = [0u8; PIPE_BUFFER_SIZE];
+                let n = read(read_fd, &mut buffer)
+                    .map_err(|e| format!("Failed to read daemon PID: {}", e))?;
+                close(read_fd)?;
+                let pid_str = std::str::from_utf8(&buffer[..n])
+                    .map_err(|e| format!("Failed to parse daemon PID: {}", e))?
+                    .trim()
+                    .to_string();
+                let _ = waitpid(child, None);
+                println!("Daemon started with PID {}", pid_str);
                 Ok(())
             }
-            Err(e) => Err(format!("Failed to daemonize: {}", e).into()),
+            Ok(ForkResult::Child) => {
+                close(read_fd)?;
+                setsid()?;
+                match unsafe { fork() } {
+                    Ok(ForkResult::Parent { .. }) => {
+                        close(write_fd)?;
+                        unsafe { libc::_exit(0) };
+                    }
+                    Ok(ForkResult::Child) => finalize_daemon(write_fd),
+                    Err(e) => {
+                        close(write_fd)?;
+                        Err(format!("Failed to fork daemon: {}", e).into())
+                    }
+                }
+            }
+            Err(e) => {
+                close(read_fd)?;
+                close(write_fd)?;
+                Err(format!("Failed to fork: {}", e).into())
+            }
         }
     }
 
     pub fn stop() -> Result<(), Box<dyn Error>> {
-        let pid_path = super::pid_file_path();
-        let Some(pid) = read_pid_from_file(&pid_path) else {
-            return Err("Daemon not running (no PID file)".into());
-        };
-
-        // Send SIGTERM
-        kill(Pid::from_raw(pid), Signal::SIGTERM)?;
-
-        // Wait for process to exit
-        let start_wait = Instant::now();
-        let timeout = Duration::from_secs(10);
-        while is_process_running(pid) {
-            if start_wait.elapsed() > timeout {
-                return Err("Timed out waiting for daemon to stop".into());
-            }
-            thread::sleep(Duration::from_millis(200));
+        match send_control_command("stop\n") {
+            Ok(Some(response)) if response == "ok" || response.is_empty() => Ok(()),
+            Ok(Some(other)) => Err(format!("Unexpected response: {}", other).into()),
+            Ok(None) => Err("Daemon not running".into()),
+            Err(err) => Err(Box::new(err)),
         }
-
-        // Cleanup PID file
-        let _ = fs::remove_file(pid_path);
-        Ok(())
     }
 
     pub fn restart() -> Result<(), Box<dyn Error>> {
@@ -133,10 +320,24 @@ mod unix_daemon {
         start()
     }
 
+    #[allow(dead_code)]
     pub fn status() -> Result<Option<i32>, Box<dyn Error>> {
-        let pid_path = super::pid_file_path();
-        let pid = read_pid_from_file(&pid_path);
-        Ok(pid)
+        request_existing_pid()
+    }
+
+    pub fn logs() -> Result<(), Box<dyn Error>> {
+        match send_control_command("logs\n") {
+            Ok(Some(response)) if response.is_empty() => {
+                println!("No logs available");
+                Ok(())
+            }
+            Ok(Some(response)) => {
+                println!("{}", response);
+                Ok(())
+            }
+            Ok(None) => Err("Daemon not running".into()),
+            Err(err) => Err(Box::new(err)),
+        }
     }
 }
 
@@ -153,8 +354,12 @@ mod no_daemon {
     pub fn restart() -> Result<(), Box<dyn Error>> {
         Err("Daemon mode is only available on Unix with feature=daemon".into())
     }
+    #[allow(dead_code)]
     pub fn status() -> Result<Option<i32>, Box<dyn Error>> {
         Ok(None)
+    }
+    pub fn logs() -> Result<(), Box<dyn Error>> {
+        Err("Daemon mode is only available on Unix with feature=daemon".into())
     }
 }
 
@@ -191,6 +396,7 @@ pub fn restart() -> Result<(), Box<dyn Error>> {
     }
 }
 
+#[allow(dead_code)]
 pub fn status() -> Result<Option<i32>, Box<dyn Error>> {
     #[cfg(all(unix, feature = "daemon"))]
     {
@@ -199,5 +405,16 @@ pub fn status() -> Result<Option<i32>, Box<dyn Error>> {
     #[cfg(not(all(unix, feature = "daemon")))]
     {
         return no_daemon::status();
+    }
+}
+
+pub fn logs() -> Result<(), Box<dyn Error>> {
+    #[cfg(all(unix, feature = "daemon"))]
+    {
+        return unix_daemon::logs();
+    }
+    #[cfg(not(all(unix, feature = "daemon")))]
+    {
+        return no_daemon::logs();
     }
 }

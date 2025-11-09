@@ -42,6 +42,12 @@ async fn main() {
                 std::process::exit(1);
             }
         }
+        cli::Commands::Logs => {
+            if let Err(e) = service::logs() {
+                eprintln!("Failed to fetch logs: {}", e);
+                std::process::exit(1);
+            }
+        }
     }
 }
 
